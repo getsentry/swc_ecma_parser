@@ -1024,6 +1024,17 @@ impl<I: Tokens> Parser<I> {
         include_decl: bool,
         decorators: Vec<Decorator>,
     ) -> PResult<Stmt> {
+        // SENTRY PATCH: see README.md. Statement nesting recurses too
+        // (nested blocks, nested function bodies), so it shares the budget.
+        self.with_recursion_guard(|p| p.parse_stmt_internal_inner(start, include_decl, decorators))
+    }
+
+    fn parse_stmt_internal_inner(
+        &mut self,
+        start: BytePos,
+        include_decl: bool,
+        decorators: Vec<Decorator>,
+    ) -> PResult<Stmt> {
         trace_cur!(self, parse_stmt_internal);
 
         let is_typescript = self.input().syntax().typescript();

@@ -60,7 +60,24 @@ pub struct Parser<I: self::input::Tokens> {
     state: State,
     input: self::input::Buffer<I>,
     found_module_item: bool,
+    /// SENTRY PATCH: see README.md. Depth of the expression recursion
+    /// currently in progress.
+    recursion_depth: usize,
 }
+
+/// SENTRY PATCH: see README.md.
+///
+/// The deepest nesting the parser will accept before reporting
+/// [`SyntaxError::TooMuchRecursion`].
+///
+/// The expression and statement grammars are mutually recursive and their
+/// depth is driven entirely by the input, so without a limit a few kilobytes
+/// of hostile source can drive the parser to any depth at all.
+///
+/// Real-world sources come nowhere near this. Across the JavaScript fixtures
+/// in getsentry/symbolic the deepest is jquery.js at 54, with jquery.min.js
+/// at 52 and a Metro bundle at 38, leaving roughly 38x headroom here.
+pub const MAX_RECURSION_DEPTH: usize = 2048;
 
 impl<I: Tokens> Parser<I> {
     #[inline(always)]
@@ -103,6 +120,28 @@ impl<I: Tokens> Parser<I> {
     fn mark_found_module_item(&mut self) {
         self.found_module_item = true;
     }
+
+    /// SENTRY PATCH: see README.md.
+    ///
+    /// Runs one level of the expression recursion, refusing to descend past
+    /// [`MAX_RECURSION_DEPTH`] and growing the stack when it runs low.
+    ///
+    /// The depth limit is what bounds the work: `maybe_grow` alone would turn
+    /// a stack overflow into unbounded heap growth, since it moves the stack
+    /// onto fresh heap segments rather than capping it. Reporting a syntax
+    /// error instead lets the caller recover, which a stack overflow (an
+    /// abort, not an unwind) never allows.
+    fn with_recursion_guard<T>(&mut self, f: impl FnOnce(&mut Self) -> PResult<T>) -> PResult<T> {
+        if self.recursion_depth >= MAX_RECURSION_DEPTH {
+            syntax_error!(self, SyntaxError::TooMuchRecursion)
+        }
+
+        self.recursion_depth += 1;
+        let result = crate::maybe_grow(256 * 1024, 1024 * 1024, || f(self));
+        self.recursion_depth -= 1;
+
+        result
+    }
 }
 
 impl<'a> Parser<crate::lexer::Lexer<'a>> {
@@ -123,6 +162,7 @@ impl<I: Tokens> Parser<I> {
             state: Default::default(),
             input: crate::parser::input::Buffer::new(input),
             found_module_item: false,
+            recursion_depth: 0,
         };
         p.input.bump(); // consume EOF
         p

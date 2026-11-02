@@ -72,6 +72,12 @@ impl<I: Tokens> Parser<I> {
         tracing::instrument(level = "debug", skip_all)
     )]
     pub(crate) fn parse_assignment_expr(&mut self) -> PResult<Box<Expr>> {
+        // SENTRY PATCH: see README.md. One level of the expression
+        // recursion, bounded and stack-grown.
+        self.with_recursion_guard(|p| p.parse_assignment_expr_inner())
+    }
+
+    fn parse_assignment_expr_inner(&mut self) -> PResult<Box<Expr>> {
         trace_cur!(self, parse_assignment_expr);
 
         if self.input().syntax().typescript() && self.input().is(Token::JSXTagStart) {
@@ -166,6 +172,12 @@ impl<I: Tokens> Parser<I> {
     }
 
     pub(super) fn parse_unary_expr(&mut self) -> PResult<Box<Expr>> {
+        // SENTRY PATCH: see README.md. One level of the expression
+        // recursion, bounded and stack-grown.
+        self.with_recursion_guard(|p| p.parse_unary_expr_inner())
+    }
+
+    fn parse_unary_expr_inner(&mut self) -> PResult<Box<Expr>> {
         trace_cur!(self, parse_unary_expr);
 
         let token_and_span = self.input().get_cur();
@@ -1515,6 +1527,12 @@ impl<I: Tokens> Parser<I> {
     }
 
     fn parse_member_expr_or_new_expr_inner(&mut self, is_new_expr: bool) -> PResult<Box<Expr>> {
+        // SENTRY PATCH: see README.md. One level of the expression
+        // recursion, bounded and stack-grown.
+        self.with_recursion_guard(|p| p.parse_member_expr_or_new_expr_innermost(is_new_expr))
+    }
+
+    fn parse_member_expr_or_new_expr_innermost(&mut self, is_new_expr: bool) -> PResult<Box<Expr>> {
         trace_cur!(self, parse_member_expr_or_new_expr);
 
         let start = self.cur_pos();

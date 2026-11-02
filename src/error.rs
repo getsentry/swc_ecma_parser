@@ -41,6 +41,9 @@ impl Error {
 #[non_exhaustive]
 pub enum SyntaxError {
     Eof,
+
+    /// SENTRY PATCH: see README.md.
+    TooMuchRecursion,
     DeclNotAllowed,
 
     UsingDeclNotAllowed,
@@ -298,6 +301,8 @@ impl SyntaxError {
     #[inline(never)]
     pub fn msg(&self) -> Cow<'static, str> {
         match self {
+            // SENTRY PATCH: see README.md.
+            SyntaxError::TooMuchRecursion => "expression nesting is too deep".into(),
             SyntaxError::PrivateNameInInterface => {
                 "private names are not allowed in interface".into()
             }

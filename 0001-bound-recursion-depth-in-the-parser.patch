@@ -1,0 +1,222 @@
+From f9509260cf58d8eb348f58f82a74ef27ed7df6b9 Mon Sep 17 00:00:00 2001
+From: Chris Klochek <christopher.klochek@sentry.io>
+Date: Mon, 2 Nov 2026 14:21:18 -0500
+Subject: [PATCH] Bound recursion depth in the parser
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+swc_ecma_parser parses expressions, and nested statements, with mutual
+recursion whose depth is driven entirely by the input. The crate's only
+stacker::maybe_grow call site covers the consequent of an if statement, so
+nesting is otherwise bounded by the thread stack and a few kilobytes of
+hostile source exhausts it. A stack overflow is a SIGSEGV/abort in Rust
+rather than an unwind, so it cannot be caught and takes the process down.
+
+On a 2 MiB stack the stock parser aborts on, among others, new(()=>…) at
+depth 297, ({a:…}) at 357, (…) at 625, nested blocks at under 5_000, prefix
+operator chains at ~4_500, and chained ternaries at ~8_760.
+
+Adding maybe_grow to those paths is not on its own a fix: it moves the stack
+onto fresh heap segments rather than capping it, which converts the abort
+into unbounded memory growth. Measured with maybe_grow alone, nesting cost
+~3.3 KB of RSS per level, an amplification of roughly 1700x from input bytes:
+a 781 KB input reached 1_329 MB of RSS, and a few megabytes of input would
+exhaust any host. That is a cheaper denial of service than the crash it
+replaces.
+
+So bound the depth and report a syntax error past the limit, with maybe_grow
+alongside it so that the permitted depth is comfortably reachable on a small
+stack. Exceeding the limit is now an ordinary SyntaxError::TooMuchRecursion,
+which callers can recover from and which flows through swc's existing
+recoverable-error machinery.
+
+Guards are placed at the four entry points of the recursion:
+
+  parse_assignment_expr                 brackets, ternaries, binary and comma
+                                        chains, arrow function bodies
+  parse_unary_expr                      prefix operator chains
+  parse_member_expr_or_new_expr_inner   new expression chains
+  parse_stmt_internal                   nested blocks and function bodies
+
+MAX_RECURSION_DEPTH is 2048. The deepest of the JavaScript fixtures in
+getsentry/symbolic is jquery.js at 54, so this leaves roughly 38x headroom.
+
+Verified:
+
+  - Behaviour-preserving. ASTs are identical to the stock crate's for all 27
+    JavaScript fixtures in getsentry/symbolic.
+  - Bounded. A 781 KB nested payload now peaks at 6 MB of RSS and a graceful
+    parse error, against 1_329 MB with maybe_grow alone and an abort on stock.
+  - No performance cost. jquery.min.js parses in 9.2 ms vs 9.7 ms stock.
+  - Sequence expressions are parsed iteratively and are unaffected: a 2 MB
+    comma chain costs 91 MB on both stock and this build.
+
+Note that dropping a deeply nested AST is also recursive. The depth limit
+keeps ASTs well clear of the depth at which that matters, but a caller that
+raises MAX_RECURSION_DEPTH substantially should re-check it.
+---
+ src/error.rs       |  5 +++++
+ src/parser/expr.rs | 18 ++++++++++++++++++
+ src/parser/mod.rs  | 40 ++++++++++++++++++++++++++++++++++++++++
+ src/parser/stmt.rs | 11 +++++++++++
+ 4 files changed, 74 insertions(+)
+
+diff --git a/src/error.rs b/src/error.rs
+index 20c4ec9..0ee480b 100644
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -41,6 +41,9 @@ impl Error {
+ #[non_exhaustive]
+ pub enum SyntaxError {
+     Eof,
++
++    /// SENTRY PATCH: see README.md.
++    TooMuchRecursion,
+     DeclNotAllowed,
+ 
+     UsingDeclNotAllowed,
+@@ -298,6 +301,8 @@ impl SyntaxError {
+     #[inline(never)]
+     pub fn msg(&self) -> Cow<'static, str> {
+         match self {
++            // SENTRY PATCH: see README.md.
++            SyntaxError::TooMuchRecursion => "expression nesting is too deep".into(),
+             SyntaxError::PrivateNameInInterface => {
+                 "private names are not allowed in interface".into()
+             }
+diff --git a/src/parser/expr.rs b/src/parser/expr.rs
+index 9ad64f6..3fd355d 100644
+--- a/src/parser/expr.rs
++++ b/src/parser/expr.rs
+@@ -72,6 +72,12 @@ impl<I: Tokens> Parser<I> {
+         tracing::instrument(level = "debug", skip_all)
+     )]
+     pub(crate) fn parse_assignment_expr(&mut self) -> PResult<Box<Expr>> {
++        // SENTRY PATCH: see README.md. One level of the expression
++        // recursion, bounded and stack-grown.
++        self.with_recursion_guard(|p| p.parse_assignment_expr_inner())
++    }
++
++    fn parse_assignment_expr_inner(&mut self) -> PResult<Box<Expr>> {
+         trace_cur!(self, parse_assignment_expr);
+ 
+         if self.input().syntax().typescript() && self.input().is(Token::JSXTagStart) {
+@@ -166,6 +172,12 @@ impl<I: Tokens> Parser<I> {
+     }
+ 
+     pub(super) fn parse_unary_expr(&mut self) -> PResult<Box<Expr>> {
++        // SENTRY PATCH: see README.md. One level of the expression
++        // recursion, bounded and stack-grown.
++        self.with_recursion_guard(|p| p.parse_unary_expr_inner())
++    }
++
++    fn parse_unary_expr_inner(&mut self) -> PResult<Box<Expr>> {
+         trace_cur!(self, parse_unary_expr);
+ 
+         let token_and_span = self.input().get_cur();
+@@ -1515,6 +1527,12 @@ impl<I: Tokens> Parser<I> {
+     }
+ 
+     fn parse_member_expr_or_new_expr_inner(&mut self, is_new_expr: bool) -> PResult<Box<Expr>> {
++        // SENTRY PATCH: see README.md. One level of the expression
++        // recursion, bounded and stack-grown.
++        self.with_recursion_guard(|p| p.parse_member_expr_or_new_expr_innermost(is_new_expr))
++    }
++
++    fn parse_member_expr_or_new_expr_innermost(&mut self, is_new_expr: bool) -> PResult<Box<Expr>> {
+         trace_cur!(self, parse_member_expr_or_new_expr);
+ 
+         let start = self.cur_pos();
+diff --git a/src/parser/mod.rs b/src/parser/mod.rs
+index bd2e347..f18720a 100644
+--- a/src/parser/mod.rs
++++ b/src/parser/mod.rs
+@@ -60,8 +60,25 @@ pub struct Parser<I: self::input::Tokens> {
+     state: State,
+     input: self::input::Buffer<I>,
+     found_module_item: bool,
++    /// SENTRY PATCH: see README.md. Depth of the expression recursion
++    /// currently in progress.
++    recursion_depth: usize,
+ }
+ 
++/// SENTRY PATCH: see README.md.
++///
++/// The deepest nesting the parser will accept before reporting
++/// [`SyntaxError::TooMuchRecursion`].
++///
++/// The expression and statement grammars are mutually recursive and their
++/// depth is driven entirely by the input, so without a limit a few kilobytes
++/// of hostile source can drive the parser to any depth at all.
++///
++/// Real-world sources come nowhere near this. Across the JavaScript fixtures
++/// in getsentry/symbolic the deepest is jquery.js at 54, with jquery.min.js
++/// at 52 and a Metro bundle at 38, leaving roughly 38x headroom here.
++pub const MAX_RECURSION_DEPTH: usize = 2048;
++
+ impl<I: Tokens> Parser<I> {
+     #[inline(always)]
+     pub fn input(&self) -> &Buffer<I> {
+@@ -103,6 +120,28 @@ impl<I: Tokens> Parser<I> {
+     fn mark_found_module_item(&mut self) {
+         self.found_module_item = true;
+     }
++
++    /// SENTRY PATCH: see README.md.
++    ///
++    /// Runs one level of the expression recursion, refusing to descend past
++    /// [`MAX_RECURSION_DEPTH`] and growing the stack when it runs low.
++    ///
++    /// The depth limit is what bounds the work: `maybe_grow` alone would turn
++    /// a stack overflow into unbounded heap growth, since it moves the stack
++    /// onto fresh heap segments rather than capping it. Reporting a syntax
++    /// error instead lets the caller recover, which a stack overflow (an
++    /// abort, not an unwind) never allows.
++    fn with_recursion_guard<T>(&mut self, f: impl FnOnce(&mut Self) -> PResult<T>) -> PResult<T> {
++        if self.recursion_depth >= MAX_RECURSION_DEPTH {
++            syntax_error!(self, SyntaxError::TooMuchRecursion)
++        }
++
++        self.recursion_depth += 1;
++        let result = crate::maybe_grow(256 * 1024, 1024 * 1024, || f(self));
++        self.recursion_depth -= 1;
++
++        result
++    }
+ }
+ 
+ impl<'a> Parser<crate::lexer::Lexer<'a>> {
+@@ -123,6 +162,7 @@ impl<I: Tokens> Parser<I> {
+             state: Default::default(),
+             input: crate::parser::input::Buffer::new(input),
+             found_module_item: false,
++            recursion_depth: 0,
+         };
+         p.input.bump(); // consume EOF
+         p
+diff --git a/src/parser/stmt.rs b/src/parser/stmt.rs
+index 634c616..27309d6 100644
+--- a/src/parser/stmt.rs
++++ b/src/parser/stmt.rs
+@@ -1023,6 +1023,17 @@ impl<I: Tokens> Parser<I> {
+         start: BytePos,
+         include_decl: bool,
+         decorators: Vec<Decorator>,
++    ) -> PResult<Stmt> {
++        // SENTRY PATCH: see README.md. Statement nesting recurses too
++        // (nested blocks, nested function bodies), so it shares the budget.
++        self.with_recursion_guard(|p| p.parse_stmt_internal_inner(start, include_decl, decorators))
++    }
++
++    fn parse_stmt_internal_inner(
++        &mut self,
++        start: BytePos,
++        include_decl: bool,
++        decorators: Vec<Decorator>,
+     ) -> PResult<Stmt> {
+         trace_cur!(self, parse_stmt_internal);
+ 
+-- 
+2.39.5 (Apple Git-154)
+
